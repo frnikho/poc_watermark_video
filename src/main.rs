@@ -12,6 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Démarrage du pipeline optimisé (Lecture directe via FFmpeg)...");
 
     let presigned_url = "https://pub-6648107f7aaa4abb97da7dea6586317c.r2.dev/output_big.mp4";
+    let presigned_url = "https://pub-6648107f7aaa4abb97da7dea6586317c.r2.dev/GIMS%20%26%20La%20Mano%201.9%20-%20PARISIENNE%20(Clip%20officiel)%20%5B7CGKeID7nRc%5D.mp4";
     let r2_endpoint = "https://42f7cb419c69ad517152e928172c5b21.r2.cloudflarestorage.com";
     let bucket_out = "test-watermark";
     let key_out = "video-processed.mp4";
@@ -25,15 +26,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let s3_client = Arc::new(Client::new(&config));
 
+    let filter_spec = "[1:v]scale=80:109[logo];[0:v][logo]overlay=10:main_h-overlay_h-10";
+
     // FFMPEG
     let mut child = Command::new("ffmpeg")
         .arg("-hide_banner")
         .arg("-i").arg(presigned_url)
-        .arg("-vf").arg("scale=1280:-1")
+        .arg("-i").arg("watermark.png")
+        .arg("-filter_complex").arg(filter_spec)
         .arg("-c:v").arg("libx264")
         .arg("-preset").arg("veryfast")
         .arg("-f").arg("mp4")
-        // Important pour le stream de sortie
         .arg("-movflags").arg("frag_keyframe+empty_moov")
         .arg("-progress").arg("pipe:2")
         .arg("pipe:1")
