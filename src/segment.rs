@@ -69,29 +69,35 @@ impl FfmpegHandle {
         let mut child = Command::new("ffmpeg")
             .args([
                 "-loglevel", "error",
-                "-ss", &start_secs.to_string(),
+                // Input seek (avant -i = seek rapide sur keyframe)
+                "-ss", &format!("{start_secs:.6}"),
                 "-i",  presign_url,
-                "-t",  &duration_secs.to_string(),
+                "-t",  &format!("{duration_secs:.6}"),
 
-                // FILTRES : On force la synchro au niveau des filtres
-                "-vf", &format!("drawtext=text='{} {}':x=10:y=10:fontsize=24:fontcolor=white", firstname, lastname),
+                // Watermark
+                "-vf", &drawtext,
 
-                // VIDÉO : On force le Constant Frame Rate (CFR)
+                // Vidéo : pas de forçage de fps, on garde le fps source
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
-                "-r", "25",                    // Force 25 images par seconde (à adapter selon ta source)
-                "-vsync", "cfr",               // Force la synchronisation vidéo constante
-                "-max_muxing_queue_size", "1024", // Évite les erreurs de queue sur les longs segments
+                "-crf", "28",
+                // IDR frame obligatoire au début du segment (HLS = segments indépendants)
+                "-force_key_frames", "expr:eq(n,0)",
 
-                // AUDIO : On force la synchro audio sur la vidéo
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-async", "1",                 // Synchronise l'audio sur le début de la vidéo
+                // Audio : copie directe si la source est déjà en AAC (cas MP4 standard).
+                // Évite le ré-encodage AAC qui introduit un encoder delay (~21ms)
+                // causant un léger gréssillement à chaque jonction de segments.
+                "-c:a", "copy",
 
-                // MUXER
+                // Offset de sortie = position réelle dans la timeline globale.
+                // Chaque segment a ses PTS qui commencent à start_secs (et non à 0),
+                // ce qui permet à hls.js de placer les segments sans recalcul,
+                // garantit la continuité audio entre segments, et empêche le
+                // player de sauter des segments courts.
+                "-output_ts_offset", &format!("{start_secs:.6}"),
+
+                // MPEG-TS sur stdout
                 "-f", "mpegts",
-                "-mpegts_flags", "resend_headers",
-                "-avoid_negative_ts", "make_zero",
                 "pipe:1",
             ])
 

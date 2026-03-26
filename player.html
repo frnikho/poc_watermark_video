@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HLS Player</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet" />
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #0a0a0a;
+            --surface: #111111;
+            --border: #222222;
+            --accent: #e8ff47;
+            --accent2: #47b8ff;
+            --text: #e8e8e8;
+            --muted: #555;
+            --error: #ff4747;
+            --success: #47ff8f;
+            --seg-buffered: #47b8ff;
+            --seg-played: #e8ff47;
+            --seg-empty: #1a1a1a;
+        }
+
+        html, body, #root { height: 100%; background: var(--bg); color: var(--text); font-family: 'IBM Plex Sans', sans-serif; }
+
+        body {
+            background-image:
+                    radial-gradient(circle at 20% 80%, rgba(232,255,71,0.03) 0%, transparent 50%),
+                    radial-gradient(circle at 80% 20%, rgba(71,184,255,0.04) 0%, transparent 50%);
+        }
+
+        .app {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem 1rem;
+        }
+
+        .header {
+            width: 100%;
+            max-width: 860px;
+            display: flex;
+            align-items: baseline;
+            gap: 1rem;
+            margin-bottom: 2.5rem;
+        }
+        .header-title { font-family: 'IBM Plex Mono', monospace; font-size: 1.1rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); }
+        .header-sep { flex: 1; height: 1px; background: linear-gradient(to right, var(--border), transparent); }
+        .header-tag { font-family: 'IBM Plex Mono', monospace; font-size: 0.65rem; color: var(--muted); letter-spacing: 0.08em; }
+
+        .card { width: 100%; max-width: 860px; background: var(--surface); border: 1px solid var(--border); position: relative; overflow: hidden; }
+        .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, var(--accent), var(--accent2), transparent); }
+
+        /* URL Bar */
+        .url-section { padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border); display: flex; gap: 0.75rem; align-items: stretch; }
+        .url-label { font-family: 'IBM Plex Mono', monospace; font-size: 0.65rem; color: var(--muted); letter-spacing: 0.1em; text-transform: uppercase; align-self: center; min-width: 28px; }
+        .url-input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 0.8rem; padding: 0.6rem 0.9rem; outline: none; transition: border-color 0.2s; }
+        .url-input:focus { border-color: var(--accent2); }
+        .url-input::placeholder { color: var(--muted); }
+        .load-btn { background: var(--accent); color: #0a0a0a; border: none; font-family: 'IBM Plex Mono', monospace; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; padding: 0 1.2rem; cursor: pointer; transition: background 0.15s, transform 0.1s; white-space: nowrap; }
+        .load-btn:hover { background: #f5ff7a; }
+        .load-btn:active { transform: scale(0.97); }
+        .load-btn:disabled { background: var(--border); color: var(--muted); cursor: not-allowed; }
+
+        /* Presets */
+        .presets { padding: 0.75rem 1.5rem; border-bottom: 1px solid var(--border); display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+        .preset-label { font-family: 'IBM Plex Mono', monospace; font-size: 0.6rem; color: var(--muted); letter-spacing: 0.1em; text-transform: uppercase; margin-right: 0.25rem; }
+        .preset-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); font-family: 'IBM Plex Mono', monospace; font-size: 0.65rem; padding: 0.25rem 0.6rem; cursor: pointer; transition: all 0.15s; letter-spacing: 0.05em; }
+        .preset-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+
+        /* Preload control */
+        .preload-section {
+            padding: 0.9rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 1.25rem;
+            flex-wrap: wrap;
+        }
+
+        .preload-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.65rem;
+            color: var(--muted);
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+
+        .seg-slider-wrap {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex: 1;
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            height: 3px;
+            background: var(--border);
+            outline: none;
+            flex: 1;
+            cursor: pointer;
+            accent-color: var(--accent2);
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            background: var(--accent2);
+            cursor: pointer;
+            border-radius: 0;
+        }
+
+        .seg-value {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--accent2);
+            min-width: 2.5rem;
+        }
+
+        .seg-duration-info {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.65rem;
+            color: var(--muted);
+        }
+
+        .seg-duration-info span {
+            color: var(--text);
+        }
+
+        /* Video */
+        .video-container { position: relative; background: #000; aspect-ratio: 16 / 9; }
+        video { width: 100%; height: 100%; display: block; }
+        .placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1rem; pointer-events: none; }
+        .placeholder-icon { width: 56px; height: 56px; border: 2px solid var(--border); border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+        .placeholder-icon svg { width: 22px; height: 22px; fill: var(--muted); margin-left: 3px; }
+        .placeholder-text { font-family: 'IBM Plex Mono', monospace; font-size: 0.7rem; color: var(--muted); letter-spacing: 0.1em; text-transform: uppercase; }
+
+        /* Buffer visualizer */
+        .buffer-section {
+            padding: 1rem 1.5rem;
+            border-top: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .buffer-header {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .buffer-title {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.6rem;
+            color: var(--muted);
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        .buffer-stats {
+            display: flex;
+            gap: 1.25rem;
+            flex-wrap: wrap;
+        }
+
+        .buf-stat {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .buf-stat-dot {
+            width: 7px;
+            height: 7px;
+            flex-shrink: 0;
+        }
+
+        .buf-stat-dot.played { background: var(--seg-played); }
+        .buf-stat-dot.buffered { background: var(--seg-buffered); }
+        .buf-stat-dot.empty { background: var(--border); border: 1px solid #333; }
+
+        .buf-stat-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.62rem;
+            color: var(--muted);
+        }
+
+        .buf-stat-val {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.62rem;
+            color: var(--text);
+        }
+
+        /* Segment grid */
+        .seg-grid {
+            display: flex;
+            gap: 2px;
+            flex-wrap: wrap;
+        }
+
+        .seg-block {
+            height: 20px;
+            flex: 1;
+            min-width: 18px;
+            max-width: 40px;
+            position: relative;
+            transition: background 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .seg-block.played { background: var(--seg-played); }
+        .seg-block.buffered { background: var(--seg-buffered); opacity: 0.7; }
+        .seg-block.loading { background: var(--seg-buffered); opacity: 0.3; animation: blink 0.6s infinite; }
+        .seg-block.empty { background: var(--seg-empty); border: 1px solid #1e1e1e; }
+
+        @keyframes blink {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 0.7; }
+        }
+
+        .seg-num {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.45rem;
+            color: rgba(0,0,0,0.6);
+            pointer-events: none;
+        }
+
+        .seg-block.empty .seg-num { color: #333; }
+
+        /* Continuous buffer bar */
+        .buf-bar-wrap {
+            position: relative;
+            height: 6px;
+            background: var(--seg-empty);
+            overflow: hidden;
+        }
+
+        .buf-bar-played {
+            position: absolute;
+            left: 0;
+            top: 0;
+            height: 100%;
+            background: var(--seg-played);
+            transition: width 0.3s;
+        }
+
+        .buf-bar-buffered {
+            position: absolute;
+            top: 0;
+            height: 100%;
+            background: var(--seg-buffered);
+            opacity: 0.6;
+            transition: left 0.3s, width 0.3s;
+        }
+
+        /* Status bar */
+        .status-bar { padding: 0.75rem 1.5rem; border-top: 1px solid var(--border); display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap; }
+        .status-item { display: flex; align-items: center; gap: 0.4rem; }
+        .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+        .status-dot.active { background: var(--success); box-shadow: 0 0 6px var(--success); }
+        .status-dot.loading { background: var(--accent); animation: pulse 1s infinite; }
+        .status-dot.error { background: var(--error); }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        .status-text { font-family: 'IBM Plex Mono', monospace; font-size: 0.65rem; color: var(--muted); letter-spacing: 0.05em; }
+        .status-text.success { color: var(--success); }
+        .status-text.error { color: var(--error); }
+        .status-spacer { flex: 1; }
+        .hls-badge { font-family: 'IBM Plex Mono', monospace; font-size: 0.6rem; padding: 0.2rem 0.5rem; border: 1px solid var(--border); color: var(--muted); letter-spacing: 0.08em; }
+        .quality-select { background: var(--bg); border: 1px solid var(--border); color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 0.65rem; padding: 0.2rem 0.4rem; cursor: pointer; outline: none; }
+        .quality-select:focus { border-color: var(--accent2); }
+        .quality-select option { background: var(--bg); }
+    </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+    const PRESETS = [
+        { label: "Big Buck Bunny", url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8" },
+        { label: "Mux Test",       url: "https://stream.mux.com/DS00Spx1CV902MCtPj5WknGlR102V5HFkDe/low.m3u8" },
+        { label: "Apple 4K",       url: "https://devstreaming-cdn.apple.com/videos/streaming/examples/adv_dv_atmos/main.m3u8" },
+    ];
+
+    const DISPLAY_SEGS = 30; // how many segment blocks to show in the grid
+
+    function App() {
+        const videoRef    = useRef(null);
+        const hlsRef      = useRef(null);
+        const rafRef      = useRef(null);
+
+        const [url, setUrl]               = useState('');
+        const [status, setStatus]         = useState('idle');
+        const [errorMsg, setErrorMsg]     = useState('');
+        const [levels, setLevels]         = useState([]);
+        const [currentLevel, setCurrentLevel] = useState(-1);
+
+        // Preload config
+        const [preloadSegs, setPreloadSegs] = useState(5);
+        const [segDuration, setSegDuration] = useState(null); // seconds per segment
+
+        // Buffer state (updated via rAF)
+        const [bufState, setBufState] = useState({
+            currentTime: 0,
+            duration: 0,
+            bufferedEnd: 0,
+            bufferedStart: 0,
+            aheadSecs: 0,
+            aheadSegs: 0,
+            loadedFrags: [], // [{start, end}]
+        });
+
+        // ── rAF loop to read video.buffered ──────────────────────────────────
+        const startRaf = useCallback(() => {
+            const tick = () => {
+                const v = videoRef.current;
+                if (!v) return;
+                const ct = v.currentTime;
+                const dur = v.duration || 0;
+                let bufferedEnd = ct, bufferedStart = ct;
+
+                for (let i = 0; i < v.buffered.length; i++) {
+                    const s = v.buffered.start(i), e = v.buffered.end(i);
+                    if (s <= ct + 0.5 && e > bufferedEnd) {
+                        bufferedEnd = e;
+                        bufferedStart = s;
+                    }
+                }
+
+                setBufState(prev => ({
+                    ...prev,
+                    currentTime: ct,
+                    duration: dur,
+                    bufferedEnd,
+                    bufferedStart,
+                    aheadSecs: Math.max(0, bufferedEnd - ct),
+                    aheadSegs: segDurationRef.current
+                        ? Math.round(Math.max(0, bufferedEnd - ct) / segDurationRef.current)
+                        : 0,
+                }));
+                rafRef.current = requestAnimationFrame(tick);
+            };
+            rafRef.current = requestAnimationFrame(tick);
+        }, []);
+
+        const stopRaf = useCallback(() => {
+            if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+        }, []);
+
+        // Keep segDuration in a ref so rAF closure can read it
+        const segDurationRef = useRef(null);
+        useEffect(() => { segDurationRef.current = segDuration; }, [segDuration]);
+
+        // ── Destroy HLS ──────────────────────────────────────────────────────
+        const destroyHls = useCallback(() => {
+            stopRaf();
+            if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+            setBufState({ currentTime:0, duration:0, bufferedEnd:0, bufferedStart:0, aheadSecs:0, aheadSegs:0, loadedFrags:[] });
+            setSegDuration(null);
+        }, [stopRaf]);
+
+        // ── Load stream ──────────────────────────────────────────────────────
+        const loadStream = useCallback((streamUrl) => {
+            const target = streamUrl || url;
+            if (!target.trim()) return;
+
+            destroyHls();
+            setStatus('loading');
+            setErrorMsg('');
+            setLevels([]);
+            setCurrentLevel(-1);
+
+            const video = videoRef.current;
+            if (!video) return;
+
+            if (!Hls.isSupported()) {
+                if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                    video.src = target;
+                    video.addEventListener('loadedmetadata', () => { setStatus('playing'); startRaf(); }, { once: true });
+                    video.addEventListener('error', () => { setStatus('error'); setErrorMsg('Erreur de chargement'); }, { once: true });
+                    video.play().catch(() => {});
+                } else {
+                    setStatus('error');
+                    setErrorMsg('HLS non supporté dans ce navigateur');
+                }
+                return;
+            }
+
+            // Compute buffer length from preload setting
+            const bufLen = preloadSegs * (segDurationRef.current || 6); // fallback: 6s segments
+
+            const hls = new Hls({
+                enableWorker: true,
+                startFragPrefetch: true,         // prefetch first frag of next level
+                maxBufferLength: bufLen,          // desired buffer in seconds
+                maxMaxBufferLength: bufLen * 3,   // upper cap
+                maxBufferSize: 0,                 // no byte cap (let time-based rule dominate)
+                lowLatencyMode: false,
+            });
+            hlsRef.current = hls;
+
+            hls.loadSource(target);
+            hls.attachMedia(video);
+
+            hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+                // Get target duration (segment duration) from the manifest
+                const td = data.levels?.[0]?.details?.targetduration
+                    || hls.levels?.[0]?.details?.targetduration
+                    || null;
+                if (td) {
+                    setSegDuration(td);
+                    segDurationRef.current = td;
+                    // Now reconfigure buffer with real segment duration
+                    const newBufLen = preloadSegs * td;
+                    hls.config.maxBufferLength    = newBufLen;
+                    hls.config.maxMaxBufferLength = newBufLen * 3;
+                }
+                setLevels(data.levels);
+                setStatus('playing');
+                startRaf();
+                video.play().catch(() => {});
+            });
+
+            hls.on(Hls.Events.LEVEL_DETAILS, (_, data) => {
+                // Update target duration when level details arrive
+                const td = data.details?.targetduration;
+                if (td && !segDurationRef.current) {
+                    setSegDuration(td);
+                    segDurationRef.current = td;
+                    const newBufLen = preloadSegs * td;
+                    hls.config.maxBufferLength    = newBufLen;
+                    hls.config.maxMaxBufferLength = newBufLen * 3;
+                }
+            });
+
+            hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => setCurrentLevel(data.level));
+
+            hls.on(Hls.Events.ERROR, (_, data) => {
+                if (data.fatal) {
+                    setStatus('error');
+                    setErrorMsg(data.details || 'Erreur fatale HLS');
+                    destroyHls();
+                }
+            });
+        }, [url, preloadSegs, destroyHls, startRaf]);
+
+        // ── Update buffer config live when slider changes ────────────────────
+        useEffect(() => {
+            if (hlsRef.current && segDurationRef.current) {
+                const newBufLen = preloadSegs * segDurationRef.current;
+                hlsRef.current.config.maxBufferLength    = newBufLen;
+                hlsRef.current.config.maxMaxBufferLength = newBufLen * 3;
+            }
+        }, [preloadSegs]);
+
+        useEffect(() => () => destroyHls(), [destroyHls]);
+
+        // ── Segment grid data ─────────────────────────────────────────────────
+        // Build an array of DISPLAY_SEGS virtual slots relative to currentTime
+        const segGrid = (() => {
+            if (!segDuration || bufState.duration === 0) return [];
+            const ct = bufState.currentTime;
+            const currentSeg = Math.floor(ct / segDuration);
+            return Array.from({ length: DISPLAY_SEGS }, (_, i) => {
+                const segIdx  = currentSeg + i - 2; // start 2 segs before current
+                const segStart = segIdx * segDuration;
+                const segEnd   = segStart + segDuration;
+                const isPlayed    = segEnd <= ct;
+                const isBuffered  = segStart >= ct && segEnd <= bufState.bufferedEnd + 0.1;
+                const isLoading   = segStart >= bufState.bufferedEnd && segStart < bufState.bufferedEnd + segDuration * 2;
+                const isCurrent   = segIdx === currentSeg;
+                return { idx: segIdx, segStart, segEnd, isPlayed, isBuffered, isLoading, isCurrent };
+            });
+        })();
+
+        // Continuous bar percentages
+        const pct = (v) => bufState.duration > 0 ? (v / bufState.duration * 100).toFixed(2) + '%' : '0%';
+
+        const statusDotClass = { idle:'', loading:'loading', playing:'active', error:'error' }[status];
+        const statusLabel    = { idle:'En attente', loading:'Chargement…', playing:'Lecture active', error:'Erreur' }[status];
+
+        return (
+            <div className="app">
+                <div className="header">
+                    <span className="header-title">▶ HLS Player</span>
+                    <div className="header-sep" />
+                    <span className="header-tag">hls.js · segment prefetch</span>
+                </div>
+
+                <div className="card">
+                    {/* URL */}
+                    <div className="url-section">
+                        <span className="url-label">URL</span>
+                        <input className="url-input" type="text" placeholder="https://example.com/stream.m3u8"
+                               value={url} onChange={e => setUrl(e.target.value)}
+                               onKeyDown={e => e.key === 'Enter' && loadStream()} spellCheck={false} />
+                        <button className="load-btn" onClick={() => loadStream()} disabled={!url.trim() || status === 'loading'}>
+                            Charger
+                        </button>
+                    </div>
+
+                    {/* Presets */}
+                    <div className="presets">
+                        <span className="preset-label">Exemples</span>
+                        {PRESETS.map(p => (
+                            <button key={p.label} className="preset-btn" onClick={() => { setUrl(p.url); loadStream(p.url); }}>
+                                {p.label}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Preload control */}
+                    <div className="preload-section">
+                        <span className="preload-label">Pré-chargement</span>
+                        <div className="seg-slider-wrap">
+                            <input type="range" min={1} max={15} step={1}
+                                   value={preloadSegs} onChange={e => setPreloadSegs(Number(e.target.value))} />
+                            <span className="seg-value">{preloadSegs}</span>
+                            <span style={{fontFamily:'IBM Plex Mono',fontSize:'0.65rem',color:'var(--muted)'}}>
+                  seg{preloadSegs > 1 ? 's' : ''}
+                </span>
+                        </div>
+                        <span className="seg-duration-info">
+                {segDuration
+                    ? <>durée/seg <span>{segDuration}s</span> → buffer cible <span>{(preloadSegs * segDuration).toFixed(0)}s</span></>
+                    : <>buffer cible ≈ <span>~{preloadSegs * 6}s</span> (seg=6s estimé)</>
+                }
+              </span>
+                    </div>
+
+                    {/* Video */}
+                    <div className="video-container">
+                        <video ref={videoRef} controls playsInline />
+                        {status === 'idle' && (
+                            <div className="placeholder">
+                                <div className="placeholder-icon">
+                                    <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                </div>
+                                <span className="placeholder-text">Entrez une URL .m3u8</span>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Buffer visualizer */}
+                    {(status === 'playing' || status === 'loading') && (
+                        <div className="buffer-section">
+                            <div className="buffer-header">
+                                <span className="buffer-title">Buffer</span>
+                                <div className="buffer-stats">
+                                    <div className="buf-stat">
+                                        <div className="buf-stat-dot played" />
+                                        <span className="buf-stat-label">Lu</span>
+                                    </div>
+                                    <div className="buf-stat">
+                                        <div className="buf-stat-dot buffered" />
+                                        <span className="buf-stat-label">Bufférisé</span>
+                                        <span className="buf-stat-val">
+                        {bufState.aheadSecs.toFixed(1)}s
+                                            {segDuration ? ` · ${bufState.aheadSegs} seg${bufState.aheadSegs !== 1 ? 's' : ''}` : ''}
+                      </span>
+                                    </div>
+                                    <div className="buf-stat">
+                                        <span className="buf-stat-label">Pos.</span>
+                                        <span className="buf-stat-val">
+                        {bufState.currentTime.toFixed(1)}s
+                                            {bufState.duration > 0 ? ` / ${bufState.duration.toFixed(0)}s` : ''}
+                      </span>
+                                    </div>
+                                    <div className="buf-stat">
+                                        <span className="buf-stat-label">Cible</span>
+                                        <span className="buf-stat-val" style={{color:'var(--accent2)'}}>
+                        {preloadSegs} seg{preloadSegs !== 1 ? 's' : ''}
+                                            {segDuration ? ` (${(preloadSegs * segDuration).toFixed(0)}s)` : ''}
+                      </span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Continuous bar */}
+                            <div className="buf-bar-wrap">
+                                <div className="buf-bar-played" style={{ width: pct(bufState.currentTime) }} />
+                                <div className="buf-bar-buffered" style={{
+                                    left: pct(bufState.currentTime),
+                                    width: pct(Math.max(0, bufState.bufferedEnd - bufState.currentTime))
+                                }} />
+                            </div>
+
+                            {/* Segment grid */}
+                            {segDuration && segGrid.length > 0 && (
+                                <div className="seg-grid">
+                                    {segGrid.map((seg, i) => {
+                                        let cls = 'empty';
+                                        if (seg.isPlayed)   cls = 'played';
+                                        else if (seg.isBuffered) cls = 'buffered';
+                                        else if (seg.isLoading)  cls = 'loading';
+                                        return (
+                                            <div
+                                                key={i}
+                                                className={`seg-block ${cls}`}
+                                                title={`Seg #${seg.idx} · ${seg.segStart.toFixed(1)}s–${seg.segEnd.toFixed(1)}s`}
+                                                style={seg.isCurrent ? { outline: '1px solid var(--accent)', outlineOffset: '-1px' } : {}}
+                                            >
+                                                <span className="seg-num">{seg.idx}</span>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Status bar */}
+                    <div className="status-bar">
+                        <div className="status-item">
+                            <div className={`status-dot ${statusDotClass}`} />
+                            <span className={`status-text ${status === 'playing' ? 'success' : status === 'error' ? 'error' : ''}`}>
+                  {statusLabel}
+                </span>
+                        </div>
+                        {status === 'error' && <span className="status-text error">{errorMsg}</span>}
+                        {levels.length > 0 && (
+                            <div className="status-item">
+                                <span className="status-text">Qualité :</span>
+                                <select className="quality-select" value={currentLevel} onChange={e => {
+                                    const v = parseInt(e.target.value);
+                                    setCurrentLevel(v);
+                                    if (hlsRef.current) hlsRef.current.currentLevel = v;
+                                }}>
+                                    <option value={-1}>Auto</option>
+                                    {levels.map((lvl, i) => (
+                                        <option key={i} value={i}>
+                                            {lvl.height ? `${lvl.height}p` : `Niveau ${i}`}
+                                            {lvl.bitrate ? ` · ${Math.round(lvl.bitrate / 1000)} kbps` : ''}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                        )}
+                        <div className="status-spacer" />
+                        <span className="hls-badge">{Hls.isSupported() ? 'MSE' : 'NATIVE'}</span>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

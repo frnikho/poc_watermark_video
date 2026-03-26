@@ -17,6 +17,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 bytes = "1.11.1"
 tokio-util = "0.7.18"
 futures-core = "0.3.32"
+tower-http = { version = "0.6.8", features = ["cors"] }
+tower = "0.5.3"
 
 [profile.release]
 opt-level = 3

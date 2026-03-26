@@ -188,7 +188,7 @@ async fn probe_keyframes_pipe(url: &str) -> Result<Keyframes> {
             "-show_packets",
             "-show_entries", "packet=pts_time,flags",
             "-of",           "csv=p=0",
-            "-",             // lit depuis stdin
+            "-",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

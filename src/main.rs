@@ -2,6 +2,7 @@ mod m3u8;
 mod segment;
 mod segmentation;
 mod video_metadata;
+mod ffprobe;
 
 use std::collections::HashMap;
 use anyhow::Result;
@@ -18,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use tower_http::cors::{CorsLayer, Any};
+use tower::ServiceBuilder;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -55,13 +59,18 @@ async fn main() -> Result<()> {
         ffmpeg_sem: Arc::new(Semaphore::new(max_ffmpeg)),
     });
 
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_origin(Any);
+
     let app = Router::new()
         .route("/metadata",                   post(extract_metadata))
         .route("/session",                    post(create_session))
         .route("/session/{session_id}/m3u8",   get(get_m3u8))
         .route("/segment/{session_id}/{index_with_ext}", get(get_segment))
         .route("/health",                     get(health))
-        .with_state(state);
+        .with_state(state)
+        .layer(ServiceBuilder::new().layer(cors));
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into());
     tracing::info!("watermark-service écoute sur {addr}");
@@ -325,6 +334,7 @@ async fn get_segment(
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use axum::http::Method;
 use futures_core::Stream;
 use tokio::sync::OwnedSemaphorePermit;
 
