@@ -1,11 +1,22 @@
 [package]
 name = "poc_watermark_video"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-aws-sdk-s3 = "1.126.0"
+redis = { version = "1.1.0", features = ["aio", "tokio-comp"] }
+anyhow = "1.0.102"
+serde = { version = "1.0.228", features = ["derive"] }
+tracing = "0.1.44"
+serde_json = "1.0.149"
 reqwest = { version = "0.13.2", features = ["stream"] }
-aws-config = {version = "1.8.15", features = ["behavior-version-latest"]}
-futures = "0.3.32"
+
+axum = "0.8.8"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+bytes = "1.11.1"
+tokio-util = "0.7.18"
+futures-core = "0.3.32"
+
+[profile.release]
+opt-level = 3

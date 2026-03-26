@@ -1,225 +1,411 @@
-use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use aws_sdk_s3::Client;
+mod m3u8;
+mod segment;
+mod segmentation;
+mod video_metadata;
+
+use std::collections::HashMap;
+use anyhow::Result;
+use axum::{
+    body::Body,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::{Semaphore, mpsc};
-use std::process::Stdio;
+use tokio::sync::{Mutex, Semaphore};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+struct AppState {
+    redis: Mutex<redis::aio::MultiplexedConnection>,
+    /// Limite le nombre de process FFmpeg simultanés.
+    /// Défaut : MAX_CONCURRENT_FFMPEG (env) ou 4.
+    ffmpeg_sem: Arc<Semaphore>,
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Démarrage du pipeline...");
+async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("watermark_service=debug".parse()?))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    let presigned_url = "https://pub-6648107f7aaa4abb97da7dea6586317c.r2.dev/output_big.mp4";
-    let presigned_url = "https://pub-6648107f7aaa4abb97da7dea6586317c.r2.dev/GIMS%20%26%20La%20Mano%201.9%20-%20PARISIENNE%20(Clip%20officiel)%20%5B7CGKeID7nRc%5D.mp4";
-    let r2_endpoint = "https://42f7cb419c69ad517152e928172c5b21.r2.cloudflarestorage.com";
-    let bucket_out = "test-watermark";
-    let key_out = "video-processed.mp4";
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1/".into());
+    let redis_client = redis::Client::open(redis_url)?;
+    let redis_conn   = redis_client.get_multiplexed_async_connection().await?;
 
-    let region_provider = RegionProviderChain::default_provider().or_else("auto");
-    let config = aws_config::from_env()
-        .region(region_provider)
-        .endpoint_url(r2_endpoint)
-        .load()
-        .await;
-    let s3_client = Arc::new(Client::new(&config));
+    let max_ffmpeg = std::env::var("MAX_CONCURRENT_FFMPEG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4usize);
 
-    let filter_spec = "[1:v]scale=80:109[logo];[0:v][logo]overlay=10:main_h-overlay_h-10";
+    tracing::info!("MAX_CONCURRENT_FFMPEG = {max_ffmpeg}");
 
-    let mut child = Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-i").arg(presigned_url)
-        .arg("-i").arg("watermark.png")
-        .arg("-filter_complex").arg(filter_spec)
-        .arg("-c:v").arg("libx264")
-        .arg("-preset").arg("veryfast")
-        .arg("-f").arg("mp4")
-        .arg("-movflags").arg("frag_keyframe+empty_moov")
-        .arg("-progress").arg("pipe:2")
-        .arg("pipe:1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let mut stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
-    // Channel pour remonter les erreurs FFmpeg détectées dans stderr
-    let (ffmpeg_err_tx, mut ffmpeg_err_rx) = mpsc::channel::<String>(1);
-
-    let monitoring_handle = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        let mut last_error = String::new();
-
-        while let Ok(Some(line)) = reader.next_line().await {
-            if line.starts_with("out_time=") {
-                println!("⏱️  {}", line.replace("out_time=", ""));
-            }
-            // FFmpeg écrit ses erreurs sur stderr aussi
-            if line.contains("Error") || line.contains("error") || line.contains("Invalid") {
-                last_error = line.clone();
-                eprintln!("⚠️  FFmpeg stderr: {}", line);
-            }
-        }
-
-        if !last_error.is_empty() {
-            let _ = ffmpeg_err_tx.send(last_error).await;
-        }
+    let state = Arc::new(AppState {
+        redis:      Mutex::new(redis_conn),
+        ffmpeg_sem: Arc::new(Semaphore::new(max_ffmpeg)),
     });
 
-    // --- Multipart upload avec abort sur erreur ---
-    let result = run_upload(&s3_client, bucket_out, key_out, &mut stdout).await;
+    let app = Router::new()
+        .route("/metadata",                   post(extract_metadata))
+        .route("/session",                    post(create_session))
+        .route("/session/{session_id}/m3u8",   get(get_m3u8))
+        .route("/segment/{session_id}/{index_with_ext}", get(get_segment))
+        .route("/health",                     get(health))
+        .with_state(state);
 
-    // On attend la fin de FFmpeg dans tous les cas
-    let ffmpeg_status = child.wait().await?;
-    let _ = monitoring_handle.await;
+    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into());
+    tracing::info!("watermark-service écoute sur {addr}");
 
-    // Vérification du exit code FFmpeg
-    if !ffmpeg_status.success() {
-        let ffmpeg_msg = ffmpeg_err_rx.try_recv().unwrap_or_else(|_| "inconnu".to_string());
-        return Err(format!(
-            "FFmpeg a échoué (code {:?}) : {}",
-            ffmpeg_status.code(),
-            ffmpeg_msg
-        ).into());
-    }
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
 
-    result?; // Propage l'erreur R2 si elle existe
-
-    println!("🎉 Job terminé avec succès !");
     Ok(())
 }
 
-async fn run_upload(
-    s3_client: &Arc<Client>,
-    bucket: &str,
-    key: &str,
-    stdout: &mut tokio::process::ChildStdout,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let multipart = s3_client
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await?;
+// ─── POST /metadata ───────────────────────────────────────────────────────────
 
-    let upload_id = multipart.upload_id()
-        .ok_or("Pas d'upload_id retourné par R2")?
-        .to_string();
+#[derive(Debug, Deserialize)]
+struct ExtractMetadataRequest {
+    video_key:   String,
+    presign_url: String,
+}
 
-    // On wrappe toute la logique pour pouvoir abort proprement en cas d'erreur
-    match upload_parts(s3_client, bucket, key, &upload_id, stdout).await {
-        Ok(completed_parts) => {
-            let final_upload = CompletedMultipartUpload::builder()
-                .set_parts(Some(completed_parts))
-                .build();
+#[derive(Debug, Serialize)]
+struct ExtractMetadataResponse {
+    video_key:      String,
+    duration_secs:  f64,
+    width:          u32,
+    height:         u32,
+    codec:          String,
+    fps:            f64,
+    keyframe_count: usize,
+}
 
-            s3_client
-                .complete_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(&upload_id)
-                .multipart_upload(final_upload)
-                .send()
-                .await?;
+async fn extract_metadata(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<ExtractMetadataRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    tracing::info!("extraction metadata pour {}", req.video_key);
 
-            println!("🏁 Upload terminé avec succès sur R2 !");
-            Ok(())
-        }
-        Err(e) => {
-            // CRITICAL : abort pour ne pas laisser des parts orphelines sur R2
-            eprintln!("❌ Erreur upload, annulation du multipart ({})...", upload_id);
-            if let Err(abort_err) = s3_client
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(&upload_id)
-                .send()
-                .await
-            {
-                eprintln!("⚠️  Échec de l'abort multipart : {}", abort_err);
-                // Log mais on remonte l'erreur originale
-            } else {
-                println!("🧹 Multipart upload annulé proprement.");
-            }
-            Err(e)
-        }
+    let mut redis = state.redis.lock().await;
+    let (meta, keyframes) = video_metadata::extract_and_store(
+        &req.video_key,
+        &req.presign_url,
+        &mut *redis,
+    ).await?;
+
+    Ok(Json(ExtractMetadataResponse {
+        video_key:      req.video_key,
+        duration_secs:  meta.duration_secs(),
+        width:          meta.width,
+        height:         meta.height,
+        fps:            meta.fps(),
+        codec:          meta.codec,
+        keyframe_count: keyframes.len(),
+    }))
+}
+
+// ─── POST /session ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionRequest {
+    video_key:   String,
+    viewer_id:   String,
+    firstname:   String,
+    lastname:    String,
+    presign_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateSessionResponse {
+    session_id:     String,
+    total_segments: usize,
+    duration_secs:  f64,
+}
+
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<CreateSessionRequest>,
+) -> Result<impl IntoResponse, AppError> {
+
+    let mut redis = state.redis.lock().await;
+
+    let meta = video_metadata::get_meta(&req.video_key, &mut *redis)
+        .await?
+        .ok_or_else(|| AppError::not_found("vidéo non trouvée — lance d'abord POST /metadata"))?;
+
+    let keyframes = video_metadata::get_keyframes(&req.video_key, &mut *redis)
+        .await?
+        .ok_or_else(|| AppError::not_found("keyframes manquants"))?;
+
+    let session_id = make_session_id(&req.viewer_id, &req.video_key);
+
+    let segments = segmentation::compute_segments(
+        &keyframes.timestamps_secs,
+        meta.duration_secs(),
+        4.0,
+    );
+
+    let session_ttl  = meta.duration_ms as u64 / 1000 + 3600;
+    let session_key  = format!("session:{session_id}");
+    let segments_json = serde_json::to_string(&segments)?;
+
+    // Utilisation explicite du trait pour éviter les conflits (E0034)
+    let _: () = redis::AsyncCommands::hset_multiple(
+        &mut *redis,
+        &session_key,
+        &[
+            ("video_key",   req.video_key.as_str()),
+            ("viewer_id",   req.viewer_id.as_str()),
+            ("firstname",   req.firstname.as_str()),
+            ("lastname",    req.lastname.as_str()),
+            ("presign_url", req.presign_url.as_str()),
+            ("segments",    segments_json.as_str()),
+        ]
+    ).await?;
+
+    let _: () = redis::AsyncCommands::expire(&mut *redis, &session_key, session_ttl as i64).await?;
+
+    tracing::info!(
+        "session {session_id} : {} segments, {:.1}s (viewer {})",
+        segments.len(), meta.duration_secs(), req.viewer_id
+    );
+
+    Ok((StatusCode::CREATED, Json(CreateSessionResponse {
+        session_id,
+        total_segments: segments.len(),
+        duration_secs:  meta.duration_secs(),
+    })))
+}
+
+// ─── GET /session/:session_id/m3u8 ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct M3u8Query {
+    base_url: Option<String>,
+}
+
+async fn get_m3u8(
+    State(state):     State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(query):     Query<M3u8Query>,
+) -> Result<impl IntoResponse, AppError> {
+
+    let mut redis = state.redis.lock().await;
+
+    // Utilisation explicite du trait
+    let segments_json: Option<String> = redis::AsyncCommands::hget(
+        &mut *redis,
+        format!("session:{session_id}"),
+        "segments"
+    ).await?;
+
+    let segments_json = segments_json
+        .ok_or_else(|| AppError::not_found("session inconnue ou expirée"))?;
+
+    let segments: Vec<segmentation::Segment> = serde_json::from_str(&segments_json)?;
+
+    let segment_base = match &query.base_url {
+        Some(base) => format!("{}/segment", base.trim_end_matches('/')),
+        None       => "/segment".to_string(),
+    };
+
+    let playlist = m3u8::M3u8Builder::new(&session_id, &segments)
+        .segment_base(&segment_base)
+        .build();
+
+    let mut headers = HeaderMap::new();
+
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.apple.mpegurl"),
+    );
+
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+
+    headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+    headers.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET, OPTIONS"));
+
+    Ok((StatusCode::OK, headers, playlist))
+}
+
+// ─── GET /segment/:session_id/:index ─────────────────────────────────────────
+
+async fn get_segment(
+    State(state):     State<Arc<AppState>>,
+    Path((session_id, index_with_ext)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+
+    let index: usize = index_with_ext
+        .replace(".ts", "")
+        .parse()
+        .map_err(|_| AppError::not_found("Index invalide"))?;
+
+    // ── 1. Récupérer la session depuis Valkey ─────────────────────────────────
+    let session_key = format!("session:{session_id}");
+
+    // On récupère TOUT le hash sous forme de HashMap<String, String>
+    let mut session_data: HashMap<String, String> = {
+        let mut redis = state.redis.lock().await;
+
+        // On utilise le trait explicitement pour éviter les conflits de noms (E0034)
+        redis::AsyncCommands::hgetall(&mut *redis, &session_key)
+            .await
+            .map_err(|e| {
+                tracing::error!("Erreur Redis hgetall: {e}");
+                AppError::not_found("session inconnue ou expirée")
+            })?
+    };
+
+    // Si la map est vide, c'est que la clé n'existe pas dans Redis
+    if session_data.is_empty() {
+        return Err(AppError::not_found("session introuvable"));
+    }
+
+    // Extraction des données (on utilise .remove() pour obtenir des String possédées)
+    let firstname   = session_data.remove("firstname").ok_or_else(|| AppError::not_found("firstname manquant"))?;
+    let lastname    = session_data.remove("lastname").ok_or_else(|| AppError::not_found("lastname manquant"))?;
+    let presign_url = session_data.remove("presign_url").ok_or_else(|| AppError::not_found("presign_url manquante"))?;
+    let segs_json   = session_data.remove("segments").ok_or_else(|| AppError::not_found("segments manquants"))?;
+
+    let segments: Vec<segmentation::Segment> = serde_json::from_str(&segs_json)?;
+
+    let seg = segments.get(index)
+        .ok_or_else(|| AppError::not_found(&format!("segment {index} inexistant")))?;
+
+    tracing::debug!(
+        "segment {session_id}/{index} : {:.3}s → {:.3}s ({:.3}s)",
+        seg.start_secs, seg.end_secs, seg.duration_secs
+    );
+
+    // ── 2. Acquérir un slot FFmpeg ───────────────────────────────────────────
+    let _permit = state.ffmpeg_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("semaphore fermé"))?;
+
+    // ── 3. Spawn FFmpeg ───────────────────────────────────────────────────────
+    // Note : on passe des &String, ce qui est correct ici
+    let (ffmpeg, stream) = segment::FfmpegHandle::spawn(
+        &presign_url,
+        seg.start_secs,
+        seg.duration_secs,
+        &firstname,
+        &lastname,
+    ).await?;
+
+    let body = Body::from_stream(PermitStream::new(stream, _permit, ffmpeg));
+
+    // ── 4. Headers HTTP ───────────────────────────────────────────────────────
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("video/mp2t"));
+    headers.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400, immutable"));
+
+    headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+    headers.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET, OPTIONS"));
+
+    Ok((StatusCode::OK, headers, body))
+}
+
+// ─── PermitStream ─────────────────────────────────────────────────────────────
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use futures_core::Stream;
+use tokio::sync::OwnedSemaphorePermit;
+
+struct PermitStream<S> {
+    inner:   S,
+    _permit: OwnedSemaphorePermit,
+    _ffmpeg: segment::FfmpegHandle,
+}
+
+impl<S> PermitStream<S> {
+    fn new(inner: S, permit: OwnedSemaphorePermit, ffmpeg: segment::FfmpegHandle) -> Self {
+        Self { inner, _permit: permit, _ffmpeg: ffmpeg }
     }
 }
 
-async fn upload_parts(
-    s3_client: &Arc<Client>,
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-    stdout: &mut tokio::process::ChildStdout,
-) -> Result<Vec<CompletedPart>, Box<dyn std::error::Error>> {
-    let semaphore = Arc::new(Semaphore::new(3));
-    let chunk_size = 15 * 1024 * 1024;
-    let mut part_number = 1i32;
-    let mut upload_tasks = Vec::new();
+impl<S, E> Stream for PermitStream<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, E>;
 
-    loop {
-        let mut buffer = vec![0u8; chunk_size];
-        let mut bytes_read = 0;
-
-        while bytes_read < chunk_size {
-            let n = stdout.read(&mut buffer[bytes_read..]).await?;
-            if n == 0 { break; }
-            bytes_read += n;
-        }
-
-        if bytes_read == 0 { break; }
-        buffer.truncate(bytes_read);
-
-        let s3_clone = Arc::clone(s3_client);
-        let sem_clone = Arc::clone(&semaphore);
-        let uid = upload_id.to_string();
-        let bkt = bucket.to_string();
-        let ky = key.to_string();
-        let p_num = part_number;
-
-        let task = tokio::spawn(async move {
-            let _permit = sem_clone.acquire().await.unwrap();
-            let body = aws_sdk_s3::primitives::ByteStream::from(buffer);
-
-            let resp = s3_clone
-                .upload_part()
-                .bucket(bkt)
-                .key(ky)
-                .upload_id(uid)
-                .part_number(p_num)
-                .body(body)
-                .send()
-                .await?; // <- propagation propre
-
-            let etag = resp.e_tag()
-                .ok_or("ETag manquant dans la réponse R2")?
-                .to_string();
-
-            Ok::<(i32, String), Box<dyn std::error::Error + Send + Sync>>((p_num, etag))
-        });
-
-        upload_tasks.push(task);
-        part_number += 1;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
     }
+}
 
-    if upload_tasks.is_empty() {
-        return Err("FFmpeg n'a produit aucune donnée".into());
+// ─── GET /health ──────────────────────────────────────────────────────────────
+
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut redis = state.redis.lock().await;
+    let ok: bool  = redis::cmd("PING")
+        .query_async::<String>(&mut *redis)
+        .await
+        .map(|r| r == "PONG")
+        .unwrap_or(false);
+
+    let slots_available = state.ffmpeg_sem.available_permits();
+
+    if ok {
+        (StatusCode::OK, format!("ok — ffmpeg slots disponibles: {slots_available}"))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "redis unreachable".into())
     }
+}
 
-    let mut completed_parts = Vec::new();
-    for task in upload_tasks {
-        let (p_num, etag) = (task.await?).unwrap(); // double ? : JoinError + notre erreur
-        completed_parts.push(
-            CompletedPart::builder()
-                .e_tag(etag)
-                .part_number(p_num)
-                .build()
-        );
+// ─── Session ID ───────────────────────────────────────────────────────────────
+
+fn make_session_id(viewer_id: &str, video_key: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    viewer_id.hash(&mut h);
+    video_key.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+// ─── Error handling ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct AppError {
+    status:  StatusCode,
+    message: String,
+}
+
+impl AppError {
+    fn not_found(msg: &str) -> Self {
+        Self { status: StatusCode::NOT_FOUND, message: msg.into() }
     }
+}
 
-    Ok(completed_parts)
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        tracing::warn!("{} — {}", self.status, self.message);
+        (self.status, self.message).into_response()
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for AppError {
+    fn from(e: E) -> Self {
+        let err = e.into();
+        tracing::error!("{err:?}");
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: err.to_string() }
+    }
 }
